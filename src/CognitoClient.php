@@ -4,6 +4,8 @@ namespace pmill\AwsCognito;
 use Aws\CognitoIdentityProvider\CognitoIdentityProviderClient;
 use Aws\CognitoIdentityProvider\Exception\CognitoIdentityProviderException;
 use Exception;
+use Psr\Http\Message\ResponseInterface;
+use RuntimeException;
 use Jose\Component\Core\AlgorithmManager;
 use Jose\Component\Core\Converter\StandardConverter;
 use Jose\Component\Core\JWKSet;
@@ -14,10 +16,23 @@ use pmill\AwsCognito\Exception\ChallengeException;
 use pmill\AwsCognito\Exception\CognitoResponseException;
 use pmill\AwsCognito\Exception\TokenExpiryException;
 use pmill\AwsCognito\Exception\TokenVerificationException;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+use Psr\Log\LogLevel;
+use Tuupola\Http\Factory\ResponseFactory;
+use Tuupola\Middleware\DoublePassTrait;
 
 class CognitoClient
 {
+    use DoublePassTrait;
+
     const CHALLENGE_NEW_PASSWORD_REQUIRED = 'NEW_PASSWORD_REQUIRED';
+    const TOKEN_REGEX = '/Bearer\s+(.*)$/i';
+
+    /**
+     * PSR-3 compliant logger.
+     */
+    private $logger;
 
     /**
      * @var string
@@ -49,16 +64,82 @@ class CognitoClient
      */
     protected $userPoolId;
 
+    protected $error;
+
+    /**
+     * @var string
+     */
+    protected $jwtKeyPath;
+
+    public function getError()
+    {
+        return $this->error;
+    }
+
+    public function setError($error)
+    {
+        $this->error = $error;
+    }
+
+    /**
+     * @return string
+     */
+    public function getJwtKeyPath(): string
+    {
+        return $this->jwtKeyPath;
+    }
+
+    /**
+     * @param string $jwtKeyPath
+     */
+    public function setJwtKeyPath(string $jwtKeyPath): void
+    {
+        $this->jwtKeyPath = $jwtKeyPath;
+    }
+
     /**
      * CognitoClient constructor.
      *
      * @param CognitoIdentityProviderClient $client
      */
-    public function __construct(CognitoIdentityProviderClient $client)
+    public function __construct(array $args = [], CognitoIdentityProviderClient $client = null)
     {
         $this->client = $client;
+
+        if(isset($args["app_client_id"]))
+            $this->appClientId = $args["app_client_id"];
+        if(isset($args["app_client_secret"]))
+            $this->appClientSecret = $args["app_client_secret"];
+        if(isset($args["region"]))
+            $this->region = $args["region"];
+        if(isset($args["user_pool_id"]))
+            $this->userPoolId = $args["user_pool_id"];
+        if(isset($args["jwt_key_path"]))
+            $this->jwtKeyPath = $args["jwt_key_path"];
+        if(isset($args["error"]))
+            $this->error = $args["error"];
+
     }
 
+    public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
+    {
+        try {
+
+            $token = $this->fetchToken($request);
+            $username = $this->verifyAccessToken($token);
+
+        } catch (RuntimeException | DomainException $exception) {
+            $response = (new ResponseFactory)->createResponse(401);
+
+            return $this->processError($response, [
+                "message" => $exception->getMessage()
+            ]);
+        }
+
+        $response = $handler->handle($request);
+
+        return $response;
+    }
     /**
      * @param string $username
      * @param string $password
@@ -169,8 +250,6 @@ class CognitoClient
      */
     public function changePassword($accessToken, $previousPassword, $proposedPassword)
     {
-        $this->verifyAccessToken($accessToken);
-
         try {
             $this->client->changePassword([
                 'AccessToken' => $accessToken,
@@ -209,8 +288,6 @@ class CognitoClient
      */
     public function deleteUser($accessToken)
     {
-        $this->verifyAccessToken($accessToken);
-
         try {
             $this->client->deleteUser([
                 'AccessToken' => $accessToken,
@@ -252,7 +329,19 @@ class CognitoClient
             $this->userPoolId
         );
 
-        return file_get_contents($url);
+        if(!is_null($this->jwtKeyPath)){
+            $storedJwtKey = file_get_contents($this->jwtKeyPath);
+
+            if($storedJwtKey){
+                return $storedJwtKey;
+            }
+        }
+
+        $jwtKey = file_get_contents($url);
+
+        file_put_contents($this->jwtKeyPath, $jwtKey);
+
+        return $jwtKey;
     }
 
     /**
@@ -389,23 +478,28 @@ class CognitoClient
      */
     public function decodeAccessToken($accessToken)
     {
-        $algorithmManager = AlgorithmManager::create([
-            new RS256(),
-        ]);
+        try {
+            $algorithmManager = AlgorithmManager::create([
+                new RS256(),
+            ]);
 
-        $serializerManager = new CompactSerializer(new StandardConverter());
+            $serializerManager = new CompactSerializer(new StandardConverter());
 
-        $jws = $serializerManager->unserialize($accessToken);
-        $jwsVerifier = new JWSVerifier(
-            $algorithmManager
-        );
+            $jws = $serializerManager->unserialize($accessToken);
+            $jwsVerifier = new JWSVerifier(
+                $algorithmManager
+            );
 
-        $keySet = $this->getJwtWebKeys();
-        if (!$jwsVerifier->verifyWithKeySet($jws, $keySet, 0)) {
-            throw new TokenVerificationException('could not verify token');
+            $keySet = $this->getJwtWebKeys();
+            if (!$jwsVerifier->verifyWithKeySet($jws, $keySet, 0)) {
+                throw new RuntimeException('Could not verify token');
+            }
+
+            return json_decode($jws->getPayload(), true);
+        }catch (Exception $ex){
+            //TODO Log Exception
+            throw new RuntimeException('Invalid Token');
         }
-
-        return json_decode($jws->getPayload(), true);
     }
 
     /**
@@ -424,15 +518,15 @@ class CognitoClient
 
         $expectedIss = sprintf('https://cognito-idp.%s.amazonaws.com/%s', $this->region, $this->userPoolId);
         if ($jwtPayload['iss'] !== $expectedIss) {
-            throw new TokenVerificationException('invalid iss');
+            throw new TokenVerificationException('Invalid ISS');
         }
 
         if ($jwtPayload['token_use'] !== 'access') {
-            throw new TokenVerificationException('invalid token_use');
+            throw new RuntimeException('Invalid token use');
         }
 
         if ($jwtPayload['exp'] < time()) {
-            throw new TokenExpiryException('invalid exp');
+            throw new RuntimeException('Token expired');
         }
 
         return $jwtPayload['username'];
@@ -483,4 +577,69 @@ class CognitoClient
 
         throw new Exception('Could not handle AdminInitiateAuth response');
     }
+
+    /**
+     * Fetch the access token.
+     */
+    private function fetchToken(ServerRequestInterface $request): string
+    {
+        $header = "";
+        $message = "Using token from request header";
+
+        /* Check for token in header. */
+        $headers = $request->getHeader('Authorization');
+        $header = isset($headers[0]) ? $headers[0] : "";
+
+        if (preg_match(self::TOKEN_REGEX, $header, $matches)) {
+            $this->log(LogLevel::DEBUG, $message);
+            return $matches[1];
+        }
+
+        /* Token not found in header try a cookie. */
+        $cookieParams = $request->getCookieParams();
+
+        if (isset($cookieParams['token'])) {
+            $this->log(LogLevel::DEBUG, "Using token from cookie");
+            $this->log(LogLevel::DEBUG, $cookieParams['token']);
+            return $cookieParams['token'];
+        };
+
+        /* If everything fails log and throw. */
+        $this->log(LogLevel::WARNING, "Token not found");
+        throw new RuntimeException("Token not found.");
+    }
+
+    /**
+     * Logs with an arbitrary level.
+     */
+    private function log($level, string $message, array $context = []): void
+    {
+        if ($this->logger) {
+            $this->logger->log($level, $message, $context);
+        }
+    }
+
+    /**
+     * Set the logger.
+     */
+    private function logger(LoggerInterface $logger = null)
+    {
+        $this->logger = $logger;
+    }
+
+    /**
+     * Call the error handler if it exists.
+     */
+    private function processError(ResponseInterface $response, array $arguments): ResponseInterface
+    {
+
+        if (is_callable($this->getError())) {
+            $handlerResponse = $this->getError()($response, $arguments);
+            if ($handlerResponse instanceof ResponseInterface) {
+                return $handlerResponse;
+            }
+        }
+        return $response;
+    }
+
 }
